@@ -1,0 +1,459 @@
+---
+title: "lab6.qmd"
+format: html
+editor: visual
+---
+
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(glue)
+library(vip)
+library(baguette)
+
+
+root  <- 'https://gdex.ucar.edu/dataset/camels/file'
+
+download.file('https://gdex.ucar.edu/dataset/camels/file/camels_attributes_v2.0.pdf', 
+              'data/camels_attributes_v2.0.pdf')
+
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+
+# Where the files live online ...
+remote_files  <- glue('{root}/camels_{types}.txt')
+# where we want to download the data ...
+local_files   <- glue('data/camels_{types}.txt')
+
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+
+# Read and merge data
+camels <- map(local_files, read_delim, show_col_types = FALSE) 
+
+camels <- power_full_join(camels ,by = 'gauge_id')
+
+```
+
+# Question 1
+```{r}
+file.exists("data/camels_attributes_v2.0.pdf")
+
+library("ggthemes")
+
+ggplot(data = camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = q_mean)) +
+  scale_color_gradient(low = "pink", high = "dodgerblue") +
+  ggthemes::theme_map()
+
+scale_color_manual(values = c("red", "yellow", "pink"))
+
+scale_color_gradient(low = "blue", high = "red")
+
+```
+
+# Question 2
+```{r}
+install.packages("patchwork")
+
+library(ggplot2)
+library(patchwork)
+
+# Map 1: Color by Aridity
+map_aridity <- ggplot(data = camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = aridity)) +
+  scale_color_viridis_c() +
+  labs(title = "Map Colored by Aridity", color = "Aridity") +
+  theme_map()
+
+# Map 2: Color by p_mean
+map_rainfall <- ggplot(data = camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = p_mean)) +
+  scale_color_viridis_c() +
+  labs(title = "Map Colored by Rainfall (p_mean)", color = "Rainfall") +
+  theme_map()
+
+# Combine the maps using patchwork
+map_aridity + map_rainfall
+
+# Scatter plot of aridity vs rainfall with q_mean as color
+ggplot(camels, aes(x = aridity, y = p_mean)) +
+  geom_point(aes(color = q_mean)) +
+  geom_smooth(method = "lm", color = "red", linetype = 2) +
+  scale_color_viridis_c() +
+  theme_linedraw() + 
+  theme(legend.position = "bottom") + 
+  labs(title = "Aridity vs Rainfall vs Runoff", 
+       x = "Aridity", 
+       y = "Rainfall",
+       color = "Mean Flow")
+
+# Log transformation of both axes and color scale
+ggplot(camels, aes(x = aridity, y = p_mean)) +
+  geom_point(aes(color = q_mean)) +
+  geom_smooth(method = "lm") +
+  scale_color_viridis_c(trans = "log") +
+  scale_x_log10() + 
+  scale_y_log10() +
+  theme_linedraw() +
+  theme(legend.position = "bottom",
+        legend.key.width = unit(2.5, "cm"),
+        legend.key.height = unit(.5, "cm")) + 
+  labs(title = "Aridity vs Rainfall vs Runoff (Log-Transformed)", 
+       x = "Aridity (Log)",
+       y = "Rainfall (Log)",
+       color = "Mean Flow")
+
+```
+
+# Model Building
+```{r}
+set.seed(123)
+# Bad form to perform simple transformations on the outcome variable within a 
+# recipe. So, we'll do it here.
+camels <- camels |> 
+  mutate(logQmean = log(q_mean))
+
+# Generate the split
+camels_split <- initial_split(camels, prop = 0.8)
+camels_train <- training(camels_split)
+camels_test  <- testing(camels_split)
+
+camels_cv <- vfold_cv(camels_train, v = 10)
+
+# Create a recipe to preprocess the data
+rec <-  recipe(logQmean ~ aridity + p_mean, data = camels_train) %>%
+  # Log transform the predictor variables (aridity and p_mean)
+  step_log(all_predictors()) %>%
+  # Add an interaction term between aridity and p_mean
+  step_interact(terms = ~ aridity:p_mean) |> 
+  # Drop any rows with missing values in the pred
+  step_naomit(all_predictors(), all_outcomes())
+
+# Prepare the data
+baked_data <- prep(rec, camels_train) |> 
+  bake(new_data = NULL)
+
+# Interaction with lm
+#  Base lm sets interaction terms with the * symbol
+lm_base <- lm(logQmean ~ aridity * p_mean, data = baked_data)
+summary(lm_base)
+
+# Sanity Interaction term from recipe ... these should be equal!!
+summary(lm(logQmean ~ aridity + p_mean + aridity_x_p_mean, data = baked_data))
+
+test_data <-  bake(prep(rec), new_data = camels_test)
+test_data$lm_pred = predict(lm_base, newdata = test_data)
+```
+
+# Model Evaluation 
+```{r}
+metrics(test_data, truth = logQmean, estimate = lm_pred)
+
+ggplot(test_data, aes(x = logQmean, y = lm_pred, colour = aridity)) +
+  # Apply a gradient color scale
+  scale_color_gradient2(low = "brown", mid = "orange", high = "darkgreen") +
+  geom_point() +
+  geom_abline(linetype = 2) +
+  theme_linedraw() + 
+  labs(title = "Linear Model: Observed vs Predicted",
+       x = "Observed Log Mean Flow",
+       y = "Predicted Log Mean Flow",
+       color = "Aridity")
+
+# Define model
+lm_model <- linear_reg() %>%
+  # define the engine
+  set_engine("lm") %>%
+  # define the mode
+  set_mode("regression")
+
+# Instatiate a workflow ...
+lm_wf <- workflow() %>%
+  # Add the recipe
+  add_recipe(rec) %>%
+  # Add the model
+  add_model(lm_model) %>%
+  # Fit the model to the training data
+  fit(data = camels_train) 
+
+# Extract the model coefficients from the workflow
+summary(extract_fit_engine(lm_wf))$coefficients
+
+# From the base implementaion
+summary(lm_base)$coefficients
+
+#
+lm_data <- augment(lm_wf, new_data = camels_test)
+dim(lm_data)
+
+metrics(lm_data, truth = logQmean, estimate = .pred)
+
+ggplot(lm_data, aes(x = logQmean, y = .pred, colour = aridity)) +
+  scale_color_viridis_c() +
+  geom_point() +
+  geom_abline() +
+  theme_linedraw()
+
+library(baguette)
+rf_model <- rand_forest() %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+
+rf_wf <- workflow() %>%
+  # Add the recipe
+  add_recipe(rec) %>%
+  # Add the model
+  add_model(rf_model) %>%
+  # Fit the model
+  fit(data = camels_train) 
+
+rf_data <- augment(rf_wf, new_data = camels_test)
+dim(rf_data)
+
+metrics(rf_data, truth = logQmean, estimate = .pred)
+
+ggplot(rf_data, aes(x = logQmean, y = .pred, colour = aridity)) +
+  scale_color_viridis_c() +
+  geom_point() +
+  geom_abline() +
+  theme_linedraw()
+
+wf <- workflow_set(list(rec), list(lm_model, rf_model)) %>%
+  workflow_map('fit_resamples', resamples = camels_cv) 
+
+autoplot(wf)
+
+rank_results(wf, rank_metric = "rsq", select_best = TRUE)
+
+```
+
+# Question 3
+```{r}
+# Load necessary libraries
+library(tidymodels)
+library(xgboost)
+library(baguette)
+library(randomForest)
+library(vip)
+library(tidyverse)
+library(powerjoin)
+
+# Define the types of data files to download
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+root <- 'https://gdex.ucar.edu/dataset/camels/file'
+
+# Create the URLs and local paths
+remote_files <- glue::glue('{root}/camels_{types}.txt')
+local_files <- glue::glue('data/camels_{types}.txt')
+
+# Download the files
+purrr::walk2(remote_files, local_files, download.file, quiet = TRUE)
+
+# Read all .txt files into a list of dataframes
+camels_list <- purrr::map(local_files, readr::read_delim, show_col_types = FALSE)
+
+# Merge the data frames by 'gauge_id'
+camels <- power_full_join(camels_list, by = "gauge_id")
+
+# Remove rows with missing q_mean values
+camels_clean <- camels %>%
+  drop_na(q_mean)
+
+# Split the data into training and testing sets
+set.seed(42)
+data_split <- initial_split(camels_clean, prop = 0.8)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# Define the recipe
+recipe_spec <- recipe(q_mean ~ aridity + p_mean, data = train_data) %>%
+  step_normalize(all_predictors())
+
+# Define model specifications
+xgb_spec <- boost_tree(mode = "regression", trees = 1000, min_n = 10, tree_depth = 6, learn_rate = 0.01) %>%
+  set_engine("xgboost")
+
+nn_spec <- bag_mlp(mode = "regression", hidden_units = 5, epochs = 100) %>%
+  set_engine("nnet")
+
+rf_spec <- rand_forest(mode = "regression", mtry = 2, trees = 1000) %>%
+  set_engine("randomForest")
+
+lm_spec <- linear_reg() %>%
+  set_engine("lm")
+
+# Create workflows
+xgb_workflow <- workflow() %>% add_recipe(recipe_spec) %>% add_model(xgb_spec)
+nn_workflow <- workflow() %>% add_recipe(recipe_spec) %>% add_model(nn_spec)
+rf_workflow <- workflow() %>% add_recipe(recipe_spec) %>% add_model(rf_spec)
+lm_workflow <- workflow() %>% add_recipe(recipe_spec) %>% add_model(lm_spec)
+
+# Fit models
+xgb_fit <- fit(xgb_workflow, data = train_data)
+nn_fit  <- fit(nn_workflow, data = train_data)
+rf_fit  <- fit(rf_workflow, data = train_data)
+lm_fit  <- fit(lm_workflow, data = train_data)
+
+# Generate predictions and merge with test data
+xgb_preds <- predict(xgb_fit, new_data = test_data) %>% bind_cols(test_data)
+nn_preds  <- predict(nn_fit, new_data = test_data) %>% bind_cols(test_data)
+rf_preds  <- predict(rf_fit, new_data = test_data) %>% bind_cols(test_data)
+lm_preds  <- predict(lm_fit, new_data = test_data) %>% bind_cols(test_data)
+
+# Ensure .pred column exists
+print(colnames(xgb_preds))
+print(head(xgb_preds))
+
+# Evaluate model performance
+xgb_metrics <- metrics(xgb_preds, truth = q_mean, estimate = .pred)
+nn_metrics  <- metrics(nn_preds, truth = q_mean, estimate = .pred)
+rf_metrics  <- metrics(rf_preds, truth = q_mean, estimate = .pred)
+lm_metrics  <- metrics(lm_preds, truth = q_mean, estimate = .pred)
+
+# Print model evaluation metrics
+print(xgb_metrics)
+print(nn_metrics)
+print(rf_metrics)
+print(lm_metrics)
+
+ 
+```
+## I would move forward with the Neutral Network Model (NN). 
+
+# Building My Own
+# Data Spliting
+```{r}
+set.seed(123)  # Ensures reproducibility
+
+# Split the data into training and testing sets (75% train, 25% test)
+camels_split <- initial_split(camels, prop = 0.75)
+
+# Extract the training and testing sets
+camels_train <- training(camels_split)
+camels_test <- testing(camels_split)
+
+# Create a 10-fold cross-validation object
+camels_cv <- vfold_cv(camels_train, v = 10)
+
+
+```
+# Recipe 
+```{r}
+# Create a new column for the log-transformed q_mean
+camels_train$log_q_mean <- log(camels_train$q_mean)
+
+# Check the new column
+head(camels_train$log_q_mean)
+
+## Define the recipe with the correct target variable and predictors
+recipe <- recipe(log_q_mean ~ p_mean + pet_mean + p_seasonality + frac_snow + aridity + high_prec_freq + high_prec_dur + high_prec_timing + low_prec_freq + low_prec_dur + 
+                   low_prec_timing + geol_1st_class + glim_1st_class_frac + geol_2nd_class + glim_2nd_class_frac + carbonate_rocks_frac + geol_porostiy + geol_permeability + 
+                   soil_depth_pelletier + soil_depth_statsgo + soil_porosity + soil_conductivity + max_water_content + sand_frac + silt_frac + clay_frac + water_frac + organic_frac + 
+                   other_frac + gauge_lat + gauge_lon + elev_mean + slope_mean + area_gages2 + area_geospa_fabric + frac_forest + lai_max + lai_diff + gvf_max + gvf_diff + 
+                   dom_land_cover_frac + dom_land_cover + root_depth_50 + root_depth_99 + q_mean + runoff_ratio + slope_fdc + baseflow_index + stream_elas + q5 + q95 + 
+                   high_q_freq + high_q_dur + low_q_freq + low_q_dur + zero_q_freq + hfd_mean, 
+                 data = camels_train)
+
+```
+# Define Models
+```{r}
+# Define the Random Forest model
+rf_model <- rand_forest(mode = "regression", engine = "ranger") %>%
+  set_args(mtry = 5, trees = 500, min_n = 10)
+
+# Define a Linear Regression model
+lm_model <- linear_reg(mode = "regression") %>%
+  set_engine("lm")
+
+# Define a Boosted Tree model
+boost_tree_model <- boost_tree(mode = "regression", engine = "xgboost") %>%
+  set_args(trees = 100, min_n = 10, tree_depth = 6)
+
+# You now have three models: rf_model, lm_model, and boost_tree_model
+
+```
+# Workflow
+```{r}
+# 1. Define models
+rf_model <- rand_forest(mode = "regression", engine = "ranger") %>%
+  set_args(mtry = 5, trees = 500, min_n = 10)
+
+lm_model <- linear_reg(mode = "regression") %>%
+  set_engine("lm")
+
+boost_tree_model <- boost_tree(mode = "regression", engine = "xgboost") %>%
+  set_args(trees = 100, min_n = 10, tree_depth = 6)
+
+# 2. Set up workflows for each model using the recipe created earlier
+wf_rf <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(rf_model)
+
+wf_lm <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(lm_model)
+
+wf_boost_tree <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(boost_tree_model)
+
+# 3. Create a 10-fold cross-validation split
+cv_splits <- vfold_cv(camels_train, v = 10)
+
+# 4. Fit resamples for each model (individually)
+rf_resamples <- fit_resamples(
+  wf_rf,
+  resamples = cv_splits,
+  metrics = metric_set(rmse, rsq)
+)
+
+lm_resamples <- fit_resamples(
+  wf_lm,
+  resamples = cv_splits,
+  metrics = metric_set(rmse, rsq)
+)
+
+boost_tree_resamples <- fit_resamples(
+  wf_boost_tree,
+  resamples = cv_splits,
+  metrics = metric_set(rmse, rsq)
+)
+
+# 5. Collect and compare the results
+rf_resamples %>%
+  collect_metrics()
+
+lm_resamples %>%
+  collect_metrics()
+
+boost_tree_resamples %>%
+  collect_metrics()
+
+# 6. Plot the results using autoplot
+autoplot(rf_resamples)
+autoplot(lm_resamples)
+autoplot(boost_tree_resamples)
+
+# 7. Rank the models based on performance
+rf_resamples %>%
+  rank_results()
+
+lm_resamples %>%
+  rank_results()
+
+boost_tree_resamples %>%
+  rank_results()
+
+
+```
+# Evaluation 
+```{r}
+# Create a 10-fold cross-validation split
+cv_splits <- vfold_cv(camels_train, v = 10)
+
+```
+
